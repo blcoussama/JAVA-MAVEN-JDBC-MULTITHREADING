@@ -1,0 +1,25 @@
+# Compiled
+*.class
+target/
+bin/
+
+# Eclipse
+.settings/
+.classpath
+.project
+
+# Maven
+*.releaseBackup
+*.versionsBackup
+
+# Package
+*.jar
+*.war
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+*.tmp
+*.bak
