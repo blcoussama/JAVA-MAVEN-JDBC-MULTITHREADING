@@ -23,3 +23,6 @@ Thumbs.db
 # Temp
 *.tmp
 *.bak
+
+# Répertoire des rapports générés (fichiers CSV)
+rapports/
