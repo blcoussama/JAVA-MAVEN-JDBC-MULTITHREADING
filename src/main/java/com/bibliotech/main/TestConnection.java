@@ -4,6 +4,7 @@ import com.bibliotech.dao.DatabaseConnection;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.Statement;
+import java.sql.*;
 
 /**
  * Classe de test pour vérifier la connexion MySQL
@@ -11,7 +12,7 @@ import java.sql.Statement;
  */
 public class TestConnection {
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws SQLException {
 
         System.out.println("╔═══════════════════════════════════════════╗");
         System.out.println("║  TEST CONNEXION MySQL - BiblioTech        ║");
