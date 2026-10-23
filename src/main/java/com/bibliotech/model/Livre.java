@@ -1,13 +1,15 @@
 package com.bibliotech.model;
 
+/** Livre du catalogue ; il connaît son auteur (association). */
 public class Livre {
-    private int id;
-    private String titre;
-    private Auteur auteur; // Association : Le livre "connaît" son auteur
-    private Categorie categorie;
-    private StatutEmprunt statut;
 
-    // Constructeur pour récupérer depuis la base (avec ID)
+    private int id;
+    private final String titre;
+    private final Auteur auteur;
+    private final Categorie categorie;
+    private final StatutEmprunt statut;
+
+    /** Livre lu depuis la base (avec identifiant). */
     public Livre(int id, String titre, Auteur auteur, Categorie categorie) {
         this.id = id;
         this.titre = titre;
@@ -16,16 +18,14 @@ public class Livre {
         this.statut = StatutEmprunt.DISPONIBLE;
     }
 
-    // Constructeur pour créer un NOUVEAU livre (sans ID)
+    /** Nouveau livre, pas encore enregistré. */
     public Livre(String titre, Auteur auteur, Categorie categorie) {
-        this.titre = titre;
-        this.auteur = auteur;
-        this.categorie = categorie;
-        this.statut = StatutEmprunt.DISPONIBLE;
+        this(0, titre, auteur, categorie);
     }
 
-    // Getters et Setters
     public int getId() { return id; }
+    /** Renseigné par le DAO après l'insertion (identifiant généré par MySQL). */
+    public void setId(int id) { this.id = id; }
     public String getTitre() { return titre; }
     public Auteur getAuteur() { return auteur; }
     public Categorie getCategorie() { return categorie; }
