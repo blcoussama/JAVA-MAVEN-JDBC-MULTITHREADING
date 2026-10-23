@@ -1,146 +1,222 @@
 package com.bibliotech.service;
 
-import com.bibliotech.model.Livre;
+import com.bibliotech.dao.AuteurDAO;
+import com.bibliotech.dao.ConnectionFactory;
+import com.bibliotech.dao.DatabaseConnection;
+import com.bibliotech.dao.LivreDAO;
+import com.bibliotech.exception.BibliothequeException;
+import com.bibliotech.exception.LivreDejaExistantException;
 import com.bibliotech.model.Auteur;
 import com.bibliotech.model.Categorie;
-import java.util.*;
+import com.bibliotech.model.Livre;
+import java.sql.SQLException;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
-import com.bibliotech.dao.LivreDAO;
-import com.bibliotech.dao.AuteurDAO;
-import com.bibliotech.exception.BibliothequeException;
-import java.sql.SQLException;
-
-import java.util.concurrent.Semaphore;
-
+/**
+ * Service métier de la bibliothèque.
+ *
+ * <p>Il regroupe :
+ * <ul>
+ *   <li>la persistance (validation métier puis appel des DAO, erreurs SQL traduites en
+ *       {@link BibliothequeException}) ;</li>
+ *   <li>des traitements en mémoire écrits deux fois, avec les Collections « classiques » puis
+ *       avec l'API Stream, pour comparer les deux styles ;</li>
+ *   <li>des traitements concurrents : parallélisme simple, accès limité par un {@link Semaphore},
+ *       insertion concurrente protégée par {@code synchronized} et par la contrainte UNIQUE.</li>
+ * </ul>
+ */
 public class BibliothequeService implements ActionBibliotheque {
-	
-	// On instancie les DAO une seule fois pour tout le service
-	private LivreDAO livreDAO = new LivreDAO();
-    private AuteurDAO auteurDAO = new AuteurDAO();
-    
-    // On crée un Sémaphore : seulement 2 threads peuvent "passer" en même temps
-    private final Semaphore semaphore = new Semaphore(3);
-    
-    
-//============================================================================//
-			 // GESTION DE LA PERSISTENCE (Base de données) //                 
-//============================================================================//
-    
- // --- PARTIE AUTEUR ---
+
+    /** Nombre de consultations simultanées autorisées par défaut (permis du sémaphore). */
+    public static final int CONSULTATIONS_SIMULTANEES_PAR_DEFAUT = 2;
 
     /**
-     * Sauvegarde un auteur.
-     * Validation métier : Le nom est obligatoire.
+     * Durée simulée d'un traitement « lourd ». MySQL répond en quelques millisecondes : sans cette
+     * pause, l'effet du parallélisme et du sémaphore ne serait pas visible dans les démonstrations.
      */
+    public static final Duration DUREE_TRAITEMENT_PAR_DEFAUT = Duration.ofSeconds(2);
+
+    /** Code d'erreur MySQL : entrée en double sur une clé unique. */
+    private static final int MYSQL_ENTREE_EN_DOUBLE = 1062;
+    /** Code d'erreur MySQL : clé étrangère sans ligne parente (auteur inexistant). */
+    private static final int MYSQL_CLE_ETRANGERE_INVALIDE = 1452;
+
+    private final LivreDAO livreDAO;
+    private final AuteurDAO auteurDAO;
+    private final int consultationsSimultanees;
+    private final Semaphore semaphore;
+    private final Duration dureeTraitement;
+    private final Consumer<String> journal;
+
+    private final AtomicInteger consultationsEnCours = new AtomicInteger();
+    private final AtomicInteger maxConsultationsObservees = new AtomicInteger();
+
+    /** Service connecté à la base décrite par les variables d'environnement BIBLIOTECH_DB_*. */
+    public BibliothequeService() {
+        this(DatabaseConnection.depuisEnvironnement());
+    }
+
+    public BibliothequeService(ConnectionFactory connexions) {
+        this(new LivreDAO(connexions), new AuteurDAO(connexions),
+                CONSULTATIONS_SIMULTANEES_PAR_DEFAUT, DUREE_TRAITEMENT_PAR_DEFAUT, System.out::println);
+    }
+
+    /**
+     * Constructeur complet (utilisé par les tests et les démonstrations).
+     *
+     * @param consultationsSimultanees nombre de permis du sémaphore (au moins 1)
+     * @param dureeTraitement          pause simulant un traitement long ({@link Duration#ZERO} pour aucune)
+     * @param journal                  destination des messages de suivi (par exemple {@code System.out::println})
+     */
+    public BibliothequeService(LivreDAO livreDAO, AuteurDAO auteurDAO, int consultationsSimultanees,
+                               Duration dureeTraitement, Consumer<String> journal) {
+        if (consultationsSimultanees < 1) {
+            throw new IllegalArgumentException("Il faut au moins une consultation simultanée autorisée.");
+        }
+        if (dureeTraitement.isNegative()) {
+            throw new IllegalArgumentException("La durée de traitement ne peut pas être négative.");
+        }
+        this.livreDAO = Objects.requireNonNull(livreDAO, "livreDAO");
+        this.auteurDAO = Objects.requireNonNull(auteurDAO, "auteurDAO");
+        this.consultationsSimultanees = consultationsSimultanees;
+        // Sémaphore équitable : les threads en attente obtiennent un permis dans leur ordre d'arrivée.
+        this.semaphore = new Semaphore(consultationsSimultanees, true);
+        this.dureeTraitement = dureeTraitement;
+        this.journal = Objects.requireNonNull(journal, "journal");
+    }
+
+    // =========================================================================
+    // Persistance : auteurs
+    // =========================================================================
+
+    /** Enregistre un auteur. Règle métier : le nom est obligatoire. */
+    @Override
     public void sauvegarderAuteur(Auteur auteur) throws BibliothequeException {
-        if (auteur.getNom() == null || auteur.getNom().trim().isEmpty()) {
-            throw new BibliothequeException("⚠️ Erreur métier : Le nom de l'auteur est obligatoire !");
+        if (auteur == null || auteur.getNom() == null || auteur.getNom().isBlank()) {
+            throw new BibliothequeException("Erreur métier : le nom de l'auteur est obligatoire.");
         }
         try {
             auteurDAO.ajouterAuteur(auteur);
         } catch (SQLException e) {
-            throw new BibliothequeException("❌ Erreur technique lors de l'ajout de l'auteur.", e);
+            throw new BibliothequeException("Erreur technique lors de l'ajout de l'auteur.", e);
         }
     }
 
-    /**
-     * Récupère tous les auteurs.
-     */
     public List<Auteur> chargerTousLesAuteurs() throws BibliothequeException {
         try {
             return auteurDAO.listerTousLesAuteurs();
         } catch (SQLException e) {
-            throw new BibliothequeException("❌ Impossible de charger la liste des auteurs.", e);
+            throw new BibliothequeException("Impossible de charger la liste des auteurs.", e);
         }
     }
 
     /**
-     * Trouve un auteur précis. 
-     * Si l'auteur n'existe pas, on lance une exception plutôt que de renvoyer null 
-     * (C'est plus propre en architecture Service).
+     * Recherche un auteur. Un identifiant inconnu est une erreur métier : le service lève une
+     * exception explicite au lieu de renvoyer {@code null}.
      */
     public Auteur chercherAuteurParId(int id) throws BibliothequeException {
         try {
-            Auteur a = auteurDAO.trouverAuteurParId(id);
-            if (a == null) {
-                throw new BibliothequeException("⚠️ Aucun auteur trouvé avec l'ID : " + id);
-            }
-            return a;
+            return auteurDAO.trouverAuteurParId(id)
+                    .orElseThrow(() -> new BibliothequeException("Aucun auteur trouvé avec l'ID : " + id));
         } catch (SQLException e) {
-            throw new BibliothequeException("❌ Erreur lors de la recherche de l'auteur ID: " + id, e);
+            throw new BibliothequeException("Erreur lors de la recherche de l'auteur ID : " + id, e);
         }
     }
-    
-  
- // --- PARTIE LIVRE ---
-    
-    // Cette méthode montre l'utilisation de BibliothequeException 
-    // pour encapsuler une erreur SQL et ajouter une validation métier.
+
+    // =========================================================================
+    // Persistance : livres
+    // =========================================================================
+
+    /**
+     * Enregistre un livre. Sans verrou Java : si plusieurs threads insèrent le même titre en même
+     * temps, c'est la contrainte {@code UNIQUE} de la base qui garantit qu'une seule insertion réussit ;
+     * les autres reçoivent une {@link LivreDejaExistantException}.
+     */
+    @Override
     public void sauvegarderLivre(Livre livre) throws BibliothequeException {
-        // Validation métier : on ne veut pas de titre vide
-        if (livre.getTitre() == null || livre.getTitre().isEmpty()) {
-            throw new BibliothequeException("Le titre ne peut pas être vide !");
-        }
-        
+        validerLivre(livre);
         try {
             livreDAO.ajouterLivre(livre);
         } catch (SQLException e) {
-            // On transforme l'erreur SQL technique en erreur métier
-            throw new BibliothequeException("Erreur lors de la sauvegarde en base", e);
+            throw traduireErreurInsertion(livre, e);
         }
     }
-    
-    
-    // VERSION POUR TESTER LE MULTI THREADING AVEC SYNCHRONIZATION
-// ============================================================================//
-//	  				  MULTI-THREADING AVEC SYNCHRONIZE                         //
-//=============================================================================//
-//    public synchronized void sauvegarderLivre(Livre livre) throws BibliothequeException {
-//        // 1. Validation : Titre vide (Ce que tu avais déjà)
-//        if (livre.getTitre() == null || livre.getTitre().trim().isEmpty()) {
-//            throw new BibliothequeException("Le titre ne peut pas être vide !");
-//        }
-//
-//        try {
-//            // 2. Validation : Existence (Utilisation des Streams)
-//            // On récupère la liste pour vérifier si le titre existe déjà
-//            List<Livre> existants = livreDAO.listerTousLesLivres();
-//            boolean dejaPresent = existants.stream()
-//                    .anyMatch(l -> l.getTitre().equalsIgnoreCase(livre.getTitre()));
-//
-//            if (dejaPresent) {
-//                // On lance l'exception si le livre existe déjà
-//                throw new BibliothequeException("Erreur : Le livre '" + livre.getTitre() + "' existe déjà !");
-//            }
-//
-//            // 3. Si tout est OK, on procède à l'insertion
-//            System.out.println("💾 [" + Thread.currentThread().getName() + "] Autorisation d'ajout pour Le livre : " + livre.getTitre());
-//            livreDAO.ajouterLivre(livre);
-//            System.out.println("✅ [" + Thread.currentThread().getName() + "] Livre sauvegardé avec succès.");
-//
-//        } catch (SQLException e) {
-//            throw new BibliothequeException("Erreur lors de la sauvegarde en base", e);
-//        }
-//    }
 
-    
-    // Récupère les livres depuis la base.
+    /**
+     * Variante « vérifier puis insérer » protégée par {@code synchronized}.
+     *
+     * <p>Sans verrou, deux threads pourraient constater en même temps que le titre est absent puis
+     * l'insérer chacun (condition de course « check-then-act »). {@code synchronized} rend la
+     * séquence vérification + insertion atomique pour les threads qui partagent cette instance.
+     * Ce verrou ne protège pas contre un autre programme ou une autre instance : la contrainte
+     * UNIQUE reste la garantie finale (elle est aussi traduite ici).
+     */
+    public synchronized void sauvegarderLivreSiAbsent(Livre livre) throws BibliothequeException {
+        validerLivre(livre);
+        try {
+            if (livreDAO.existeTitre(livre.getTitre())) {
+                throw new LivreDejaExistantException(
+                        "Le livre '" + livre.getTitre() + "' existe déjà (détecté par la vérification Java).");
+            }
+            livreDAO.ajouterLivre(livre);
+        } catch (SQLException e) {
+            throw traduireErreurInsertion(livre, e);
+        }
+    }
+
+    @Override
     public List<Livre> chargerTousLesLivres() throws BibliothequeException {
         try {
             return livreDAO.listerTousLesLivres();
         } catch (SQLException e) {
-            throw new BibliothequeException("Impossible de charger la bibliothèque", e);
+            throw new BibliothequeException("Impossible de charger la bibliothèque.", e);
         }
     }
 
-	
-//============================================================================//
-					// METHODES VERSIONS COLLECTIONS //
-//============================================================================//
+    private static void validerLivre(Livre livre) throws BibliothequeException {
+        if (livre == null) {
+            throw new BibliothequeException("Erreur métier : aucun livre fourni.");
+        }
+        if (livre.getTitre() == null || livre.getTitre().isBlank()) {
+            throw new BibliothequeException("Erreur métier : le titre ne peut pas être vide.");
+        }
+        if (livre.getAuteur() == null || livre.getAuteur().getId() <= 0) {
+            throw new BibliothequeException("Erreur métier : le livre doit être rattaché à un auteur enregistré.");
+        }
+        if (livre.getCategorie() == null) {
+            throw new BibliothequeException("Erreur métier : la catégorie est obligatoire.");
+        }
+    }
 
-    // 1. CONCEPT : LIST (ArrayList)
-    // On l'utilise déjà, mais ici on montre comment filtrer manuellement
+    private static BibliothequeException traduireErreurInsertion(Livre livre, SQLException e) {
+        return switch (e.getErrorCode()) {
+            case MYSQL_ENTREE_EN_DOUBLE -> new LivreDejaExistantException(
+                    "Le livre '" + livre.getTitre() + "' existe déjà (refusé par la contrainte UNIQUE de la base).", e);
+            case MYSQL_CLE_ETRANGERE_INVALIDE -> new BibliothequeException(
+                    "L'auteur ID " + livre.getAuteur().getId() + " n'existe pas en base.", e);
+            default -> new BibliothequeException("Erreur lors de la sauvegarde en base.", e);
+        };
+    }
+
+    // =========================================================================
+    // Collections « classiques »
+    // =========================================================================
+
+    /** List (ArrayList) : filtrage manuel avec une boucle. */
     public List<Livre> filtrerParCategorie(List<Livre> tousLesLivres, Categorie cible) {
         List<Livre> resultat = new ArrayList<>();
         for (Livre l : tousLesLivres) {
@@ -151,10 +227,8 @@ public class BibliothequeService implements ActionBibliotheque {
         return resultat;
     }
 
-    // 2. CONCEPT : SET (HashSet)
-    // Objectif : Extraire les catégories uniques présentes dans la liste
+    /** Set (HashSet) : un ensemble refuse les doublons, on obtient donc les catégories distinctes. */
     public Set<Categorie> obtenirCategoriesUniques(List<Livre> tousLesLivres) {
-        // Le HashSet refuse les doublons automatiquement !
         Set<Categorie> categories = new HashSet<>();
         for (Livre l : tousLesLivres) {
             categories.add(l.getCategorie());
@@ -162,162 +236,198 @@ public class BibliothequeService implements ActionBibliotheque {
         return categories;
     }
 
-    // 3 CONCEPT : MAP (HashMap / Indexation)
-    // Objectif : Créer un dictionnaire "Titre -> Objet Livre" pour une recherche éclair
+    /**
+     * Map : index « titre → livre » pour une recherche directe sans parcourir la liste.
+     * Si deux livres portent le même titre, le premier rencontré est conservé.
+     */
     public Map<String, Livre> indexerLivresParTitre(List<Livre> tousLesLivres) {
-        Map<String, Livre> index = new HashMap<>();
+        Map<String, Livre> index = new LinkedHashMap<>();
         for (Livre l : tousLesLivres) {
-            // Clé : le titre (String), Valeur : l'objet Livre complet
-            index.put(l.getTitre(), l);
+            index.putIfAbsent(l.getTitre(), l);
         }
         return index;
     }
-    
-    // 4. CONCEPT : TRIE (Collection avec Comparator)
-    // tri alphabétique par Titre
+
+    /** Tri en place par titre (A → Z, insensible à la casse) avec un Comparator anonyme (style pré-Java 8). */
     public void trierLivresParTitre(List<Livre> tousLesLivres) {
-        // Collections.sort prend la liste et un "comparateur"
         Collections.sort(tousLesLivres, new Comparator<Livre>() {
             @Override
             public int compare(Livre l1, Livre l2) {
-                // On utilise le compareTo de la classe String
-                // Renvoie : 
-                //   négatif si l1 < l2
-                //   zéro si l1 == l2
-                //   positif si l1 > l2
+                // Négatif si l1 < l2, zéro si égaux, positif si l1 > l2.
                 return l1.getTitre().compareToIgnoreCase(l2.getTitre());
             }
         });
     }
-    
-    // tri Numerique Par ID du Plus Recent au plus ancien
+
+    /** Tri en place par identifiant décroissant (du plus récent au plus ancien). */
     public void trierLivresParId(List<Livre> tousLesLivres) {
         Collections.sort(tousLesLivres, new Comparator<Livre>() {
             @Override
             public int compare(Livre l1, Livre l2) {
-                // On compare deux entiers (id)
                 return Integer.compare(l2.getId(), l1.getId());
             }
         });
     }
-    
-//============================================================================//
-    				   // METHODES VERSIONS STREAMS //
-//============================================================================//
-    
-    
-    // VERSION MODERNE 1 : LE STREAM (Filtre)
-    // 1. On ouvre le flux (.stream)
-    // 2. On garde seulement si la condition est vraie (.filter)
-    // 3. On remet tout dans une liste (.toList)
+
+    // =========================================================================
+    // API Stream (mêmes traitements, style déclaratif ; la liste source n'est jamais modifiée)
+    // =========================================================================
+
+    /** stream → filter → toList. */
     public List<Livre> filtrerParCategorieStream(List<Livre> tousLesLivres, Categorie cible) {
         return tousLesLivres.stream()
                 .filter(l -> l.getCategorie() == cible)
-                .toList(); // Si tu as une erreur ici (Java < 16), dis-le moi !
+                .toList();
     }
-    
-	// VERSION MODERNE 2 : LE STREAM (Set / Unicité)
+
+    /** map extrait les catégories (avec doublons), le collecteur toSet les élimine. */
     public Set<Categorie> obtenirCategoriesUniquesStream(List<Livre> tousLesLivres) {
         return tousLesLivres.stream()
-                .map(Livre::getCategorie) // 1. On extrait toutes les catégories (avec doublons)
-                .collect(Collectors.toSet()); // 2. On les collecte dans un Set (les doublons disparaissent !)
+                .map(Livre::getCategorie)
+                .collect(Collectors.toSet());
     }
-    
-    // VERSION MODERNE 3.1 : LE STREAM (Map / Indexation)
-    // Trouve un Livre Par Son Titre
+
+    /**
+     * Index « titre → livre ». La fonction de fusion {@code (premier, doublon) -> premier} est
+     * indispensable : sans elle, {@link Collectors#toMap} lève une {@link IllegalStateException}
+     * dès que deux livres portent le même titre.
+     */
     public Map<String, Livre> indexerLivresParTitreStream(List<Livre> tousLesLivres) {
         return tousLesLivres.stream()
                 .collect(Collectors.toMap(
-                    Livre::getTitre, 
-                    l -> l
-                ));
+                        Livre::getTitre,
+                        l -> l,
+                        (premier, doublon) -> premier,
+                        LinkedHashMap::new));
     }
-    
-    // VERSION MODERNE 3.2 : LE STREAM (Map / Transformation)
-    // Transforme une List<Livre> en List<String>
+
+    /** Transformation List&lt;Livre&gt; → List&lt;String&gt;. */
     public List<String> obtenirSeulementLesTitres(List<Livre> tousLesLivres) {
         return tousLesLivres.stream()
-                .map(l -> l.getTitre()) // Pour chaque livre l, on extrait son titre
+                .map(Livre::getTitre)
                 .toList();
     }
-    
-    // VERSION MODERNE : LE STREAM (Tri)
-    // Trie par titre (A-Z) et renvoie une NOUVELLE liste (ne touche pas l'originale)
+
+    /** Tri par titre (A → Z, insensible à la casse) dans une nouvelle liste. */
     public List<Livre> trierLivresParTitreStream(List<Livre> tousLesLivres) {
         return tousLesLivres.stream()
-                .sorted(Comparator.comparing(Livre::getTitre))
+                .sorted(Comparator.comparing(Livre::getTitre, String.CASE_INSENSITIVE_ORDER))
                 .toList();
     }
-    
-    // Trie par ID (Du Plus Recent au Plus Ancien) et renvoie une NOUVELLE liste (ne touche pas l'originale)
+
+    /** Tri par identifiant décroissant dans une nouvelle liste. */
     public List<Livre> trierLivresParNumeroIDStream(List<Livre> tousLesLivres) {
         return tousLesLivres.stream()
-                .sorted(Comparator.comparing(Livre::getId).reversed())
+                .sorted(Comparator.comparingInt(Livre::getId).reversed())
                 .toList();
     }
-    
-// ============================================================================//
-//  					  LAMBDA SEULE (SANS STREAM)                           //
-//=============================================================================//
 
-	/**
-	* Supprime les livres d'une liste selon un mot-clé présent dans le titre.
-	* Utilise la méthode removeIf() qui accepte une Lambda (Predicate).
-	*/
-	public void supprimerLivresParMotCle(List<Livre> livres, String motCle) {
-	// La lambda 'l -> ...' définit la condition de suppression
-	livres.removeIf(l -> l.getTitre().toLowerCase().contains(motCle.toLowerCase()));
-	}
-	
-// ============================================================================//
-//  					MULTI-THREADING AVEC SEMAPHORE                         //
-//=============================================================================//
+    /** Chaînage complet : filtre, tri puis transformation en titres. */
+    public List<String> titresTriesDeCategorie(List<Livre> tousLesLivres, Categorie cible) {
+        return tousLesLivres.stream()
+                .filter(l -> l.getCategorie() == cible)
+                .map(Livre::getTitre)
+                .sorted(String.CASE_INSENSITIVE_ORDER)
+                .toList();
+    }
 
-    // Nouvelle méthode pour simuler une consultation "lourde"
-	public void consulterLivresSimultane(String nomUtilisateur) {
-	    try {
-	        System.out.println("👤 [" + nomUtilisateur + "] attend un accès à la base...");
-	        
-	        // --- DÉBUT DE LA ZONE PROTÉGÉE ---
-	        semaphore.acquire(); 
-	        
-	        System.out.println("✅ [" + nomUtilisateur + "] ACCÈS ACCORDÉ !");
-	        
-	        // ACTION RÉELLE SUR LA BASE : On compte les livres
-	        int nbLivres = livreDAO.listerTousLesLivres().size();
-	        System.out.println("📊 [" + nomUtilisateur + "] Lecture DB en cours... Nombre de livres trouvés : " + nbLivres);
+    // =========================================================================
+    // Lambda seule (sans Stream)
+    // =========================================================================
 
-	        // On garde le sleep de 2s pour que TU puisses voir le blocage à l'écran
-	        // sinon MySQL répond trop vite (0.001s) et on ne voit pas le Sémaphore agir.
-	        Thread.sleep(10000); 
-	        
-	        System.out.println("📖 [" + nomUtilisateur + "] a fini sa lecture.");
-	        
-	    } catch (Exception e) {
-	        System.err.println("❌ Erreur pour " + nomUtilisateur + " : " + e.getMessage());
-	    } finally {
-	        // --- FIN DE LA ZONE PROTÉGÉE ---
-	        System.out.println("🔓 [" + nomUtilisateur + "] libère la connexion.");
-	        semaphore.release();
-	    }
-	}
- 
-// ============================================================================//
-//							MULTI-THREADING SIMPLE                             //
-//=============================================================================//
-    public void recupererTotalLivresLentement(String nomThread) {
+    /**
+     * Retire de la liste les livres dont le titre contient le mot-clé (insensible à la casse),
+     * grâce à {@link List#removeIf} qui reçoit une lambda (Predicate).
+     *
+     * @return {@code true} si au moins un livre a été retiré
+     */
+    public boolean supprimerLivresParMotCle(List<Livre> livres, String motCle) {
+        Objects.requireNonNull(motCle, "motCle");
+        String cible = motCle.toLowerCase(Locale.ROOT);
+        return livres.removeIf(l -> l.getTitre().toLowerCase(Locale.ROOT).contains(cible));
+    }
+
+    // =========================================================================
+    // Multithreading : accès limité par un sémaphore
+    // =========================================================================
+
+    /**
+     * Consultation « lourde » du catalogue : au plus {@code consultationsSimultanees} threads
+     * l'exécutent en même temps, les autres attendent un permis.
+     *
+     * <p>{@code acquire()} est appelé <strong>avant</strong> le bloc {@code try} : si l'attente est
+     * interrompue, aucun permis n'a été obtenu et le {@code finally} (qui rend le permis) n'est pas
+     * exécuté. Placer {@code acquire()} dans le {@code try} rendrait un permis jamais obtenu et
+     * augmenterait la capacité du sémaphore. L'interruption n'est pas avalée : elle est propagée
+     * à l'appelant.
+     *
+     * @return le nombre de livres lus
+     */
+    public int consulterLivresSimultane(String nomUtilisateur) throws BibliothequeException, InterruptedException {
+        journal.accept("[" + nomUtilisateur + "] attend un accès à la base...");
+        semaphore.acquire();
+        int enCours = consultationsEnCours.incrementAndGet();
+        maxConsultationsObservees.accumulateAndGet(enCours, Math::max);
         try {
-            System.out.println("⏳ [" + nomThread + "] Connexion à la base de données...");
-            
-            // On simule une connexion qui prend 2 secondes
-            Thread.sleep(2000); 
-            
-            // On fait une vraie action SQL
-            int total = livreDAO.listerTousLesLivres().size();
-            
-            System.out.println("✅ [" + nomThread + "] Terminé ! Total trouvé : " + total + " livres.");
-        } catch (Exception e) {
-            System.err.println("Erreur : " + e.getMessage());
+            journal.accept("[" + nomUtilisateur + "] accès accordé (" + enCours + "/" + consultationsSimultanees
+                    + " consultations en cours)");
+            int nbLivres = livreDAO.listerTousLesLivres().size();
+            journal.accept("[" + nomUtilisateur + "] lecture en cours : " + nbLivres + " livres trouvés");
+            Thread.sleep(dureeTraitement);
+            return nbLivres;
+        } catch (SQLException e) {
+            throw new BibliothequeException("Erreur de lecture pour " + nomUtilisateur + ".", e);
+        } finally {
+            consultationsEnCours.decrementAndGet();
+            semaphore.release();
+            journal.accept("[" + nomUtilisateur + "] libère son accès.");
         }
-    }    
+    }
+
+    // =========================================================================
+    // Multithreading : parallélisme simple
+    // =========================================================================
+
+    /**
+     * Simule un traitement lent (pause de {@code dureeTraitement}) suivi d'une vraie requête SQL.
+     * Appelée deux fois de suite, elle dure deux fois plus longtemps qu'appelée dans deux threads.
+     */
+    public int recupererTotalLivresLentement(String nomTache) throws BibliothequeException, InterruptedException {
+        journal.accept("[" + nomTache + "] traitement en cours...");
+        Thread.sleep(dureeTraitement);
+        try {
+            int total = livreDAO.compterLivres();
+            journal.accept("[" + nomTache + "] terminé : " + total + " livres.");
+            return total;
+        } catch (SQLException e) {
+            throw new BibliothequeException("Erreur de lecture pour " + nomTache + ".", e);
+        }
+    }
+
+    // =========================================================================
+    // Observation (tests et démonstrations)
+    // =========================================================================
+
+    public int getConsultationsSimultanees() {
+        return consultationsSimultanees;
+    }
+
+    /** Permis actuellement libres ; égal à {@link #getConsultationsSimultanees()} au repos. */
+    public int permisDisponibles() {
+        return semaphore.availablePermits();
+    }
+
+    /** Nombre (estimé) de threads bloqués en attente d'un permis. */
+    public int threadsEnAttente() {
+        return semaphore.getQueueLength();
+    }
+
+    public int getConsultationsEnCours() {
+        return consultationsEnCours.get();
+    }
+
+    /** Plus grand nombre de consultations simultanées observé depuis la création du service. */
+    public int getMaxConsultationsObservees() {
+        return maxConsultationsObservees.get();
+    }
 }
