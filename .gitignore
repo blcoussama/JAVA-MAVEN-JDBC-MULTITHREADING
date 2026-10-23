@@ -1,28 +1,39 @@
-# Compiled
-*.class
+# Build
 target/
+*.class
 bin/
 
-# Eclipse
+# Eclipse / IntelliJ / VS Code
 .settings/
 .classpath
 .project
+.factorypath
+.idea/
+*.iml
+.vscode/
 
 # Maven
 *.releaseBackup
 *.versionsBackup
+release.properties
 
-# Package
+# Paquets
 *.jar
 *.war
+!.mvn/wrapper/maven-wrapper.jar
+
+# Configuration locale (secrets)
+.env
+.env.*
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Temp
+# Temporaires
 *.tmp
 *.bak
+*.log
 
-# Répertoire des rapports générés (fichiers CSV)
+# Rapports générés (CSV)
 rapports/
